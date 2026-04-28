@@ -1,0 +1,10 @@
+*.test
+*.out
+/coverage.out
+/vendor/
+.idea/
+.vscode/
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
