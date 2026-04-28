@@ -48,16 +48,6 @@ type Contact struct {
 	Business  string `json:"businessName,omitempty"`
 }
 
-// MediaPayload is returned by GetMedia.
-type MediaPayload struct {
-	MessageID string    `json:"messageId"`
-	Kind      MediaKind `json:"kind"`
-	MIMEType  string    `json:"mimeType,omitempty"`
-	Filename  string    `json:"filename,omitempty"`
-	Size      int64     `json:"size"`
-	DataB64   string    `json:"dataBase64"`
-}
-
 // QRPairing carries the QR codes the user scans on their phone.
 type QRPairing struct {
 	// Code is the raw QR payload string. Use ASCII or Image to display.

@@ -2,7 +2,6 @@ package whatsapp
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"os"
@@ -179,39 +178,3 @@ func whatsmeowMediaType(k MediaKind) (whatsmeow.MediaType, error) {
 	}
 	return "", fmt.Errorf("%w: unknown media kind %q", ErrInvalidParams, k)
 }
-
-// GetMedia downloads the media payload of a previously-received message
-// and returns it as base64. Looks up the original whatsmeow proto via
-// the local log (which stored a row but not the proto), so this requires
-// the message to be re-fetched. Since we don't persist the raw proto,
-// the caller must pass it as part of a recent event flow OR the caller
-// must use whatsmeow's Download via a separately-held event reference.
-//
-// In practice agents will fetch attachments while the message is fresh:
-// call GetMessages, see has_media=true, then call GetMedia immediately.
-// We re-derive the download by re-pulling the message from the local
-// log's media metadata; if that's insufficient, returns ErrUnsupportedMedia
-// with guidance to re-receive the message.
-//
-// NOTE: this is a deliberately conservative implementation. Persisting
-// raw protos is an MPL/PII concern handled in a follow-up.
-func (c *Client) GetMedia(ctx context.Context, messageID string) (MediaPayload, error) {
-	if strings.TrimSpace(messageID) == "" {
-		return MediaPayload{}, fmt.Errorf("%w: messageID required", ErrInvalidParams)
-	}
-	if err := c.requireConnected(); err != nil {
-		return MediaPayload{}, err
-	}
-	// We only have metadata in the local log — without the encrypted
-	// MediaKey/SHA digests, we can't reconstruct a download. Return a
-	// clear error so callers know to wire a richer flow if they need
-	// inline media.
-	return MediaPayload{
-		MessageID: messageID,
-	}, fmt.Errorf("%w: in-process attachment download requires the original event proto; "+
-		"persist raw_message in your event handler and call whatsmeow.Client.Download directly",
-		ErrUnsupportedMedia)
-}
-
-// dataB64 is a small helper kept exported-like for tests.
-func dataB64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }

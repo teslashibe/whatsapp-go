@@ -38,7 +38,7 @@ func (Provider) Tools() []mcptool.Tool {
 	out := make([]mcptool.Tool, 0,
 		len(statusTools)+len(authTools)+len(chatTools)+
 			len(searchTools)+len(sendTools)+len(reactTools)+
-			len(contactTools)+len(mediaTools)+len(watchTools))
+			len(contactTools)+len(watchTools))
 	out = append(out, statusTools...)
 	out = append(out, authTools...)
 	out = append(out, chatTools...)
@@ -46,7 +46,6 @@ func (Provider) Tools() []mcptool.Tool {
 	out = append(out, sendTools...)
 	out = append(out, reactTools...)
 	out = append(out, contactTools...)
-	out = append(out, mediaTools...)
 	out = append(out, watchTools...)
 	return out
 }

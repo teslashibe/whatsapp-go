@@ -16,9 +16,7 @@
 package whatsapp
 
 import (
-	"context"
 	"database/sql"
-	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -53,11 +51,13 @@ type Client struct {
 	maxMediaBytes  int64
 	logger         waLog.Logger
 
-	mu         sync.RWMutex
-	wmeowClient *whatsmeow.Client
-	logDB      *sql.DB
-	connected  bool
-	closed     bool
+	mu              sync.RWMutex
+	wmeowClient     *whatsmeow.Client
+	wmeowEpoch      uint64 // bumped each time wmeowClient is replaced
+	handlerInstalled bool   // true once handleEvent is registered on wmeowClient
+	logDB           *sql.DB
+	connected       bool
+	closed          bool
 }
 
 const (
@@ -109,7 +109,15 @@ func WithAllowedRecipients(jids []string) Option {
 		}
 		m := make(map[string]struct{}, len(jids))
 		for _, j := range jids {
-			m[NormalizeJID(j)] = struct{}{}
+			n := NormalizeJID(j)
+			if n == "" {
+				continue
+			}
+			m[n] = struct{}{}
+		}
+		if len(m) == 0 {
+			c.allowedJIDs = nil
+			return
 		}
 		c.allowedJIDs = m
 	}
@@ -143,6 +151,8 @@ func (c *Client) Close() error {
 	if c.wmeowClient != nil {
 		c.wmeowClient.Disconnect()
 		c.wmeowClient = nil
+		c.handlerInstalled = false
+		c.wmeowEpoch++
 		c.connected = false
 	}
 	if c.logDB != nil {
@@ -208,6 +218,3 @@ func defaultStoreDir() string {
 	return filepath.Join(home, "Library", "Application Support", "teslashibe", "whatsapp-go")
 }
 
-// errExporter exposes context.Cancel etc. for tests; not part of public API.
-var _ = errors.Is
-var _ context.Context

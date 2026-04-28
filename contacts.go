@@ -85,23 +85,22 @@ func (c *Client) IsOnWhatsApp(ctx context.Context, phones []string) (map[string]
 	// Normalise to "+digits" form (whatsmeow expects the leading + and digits).
 	canonical := make([]string, 0, len(phones))
 	rev := make(map[string]string, len(phones)) // canonical -> original
+	out := map[string]bool{}                    // pre-populated with false for unresolvable
 	for _, p := range phones {
 		jid := NormalizeJID(p)
-		if jid == "" {
+		// Reject group JIDs and anything we couldn't normalise.
+		if jid == "" || IsGroupJID(jid) {
+			out[p] = false
 			continue
 		}
-		// Strip "@s.whatsapp.net" and re-add leading "+".
-		user := jid
-		if i := strings.IndexByte(user, '@'); i >= 0 {
-			user = user[:i]
-		}
-		canonical = append(canonical, "+"+user)
-		rev["+"+user] = p
+		user := jid[:strings.IndexByte(jid, '@')]
+		key := "+" + user
+		canonical = append(canonical, key)
+		rev[key] = p
 	}
 	if len(canonical) == 0 {
-		return map[string]bool{}, nil
+		return out, nil
 	}
-	out := map[string]bool{}
 	err := c.withClient(func(wm *whatsmeow.Client) error {
 		results, err := wm.IsOnWhatsApp(ctx, canonical)
 		if err != nil {

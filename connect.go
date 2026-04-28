@@ -3,7 +3,6 @@ package whatsapp
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -42,14 +41,19 @@ func (c *Client) Connect(ctx context.Context) error {
 		return ErrPairingRequired
 	}
 
-	// Wire event handler before Connect so we don't race the first event.
-	wm.AddEventHandler(c.handleEvent)
+	// Install the handler under the lock so a concurrent Disconnect can't
+	// orphan us, and only register once per client instance.
+	c.installHandler(wm)
 	if err := wm.Connect(); err != nil {
+		c.mu.Lock()
+		if c.wmeowClient == wm {
+			c.wmeowClient = nil
+			c.handlerInstalled = false
+		}
+		c.mu.Unlock()
 		return fmt.Errorf("whatsapp: connect: %w", err)
 	}
-
 	c.mu.Lock()
-	c.wmeowClient = wm
 	c.connected = true
 	c.mu.Unlock()
 	return nil
@@ -61,6 +65,8 @@ func (c *Client) Disconnect(ctx context.Context) error {
 	c.mu.Lock()
 	wm := c.wmeowClient
 	c.wmeowClient = nil
+	c.handlerInstalled = false
+	c.wmeowEpoch++
 	c.connected = false
 	c.mu.Unlock()
 	if wm != nil {
@@ -69,12 +75,19 @@ func (c *Client) Disconnect(ctx context.Context) error {
 	return nil
 }
 
-// PairQR yields a QR code that the user scans from
-// Settings → Linked Devices in the WhatsApp app. Blocks until pairing
-// succeeds, the context cancels, or the QR sequence times out.
+// PairQR begins QR pairing and returns the first scannable QR code as
+// soon as it's available. The returned ASCII rendering is suitable for
+// terminal display; the raw Code is also returned for callers that want
+// to render it themselves.
 //
-// On success, the device session is persisted; subsequent calls to
-// Connect skip pairing.
+// If the device is already paired, PairQR transparently connects and
+// returns an empty QRPairing. If pairing fails, ErrPairingTimeout or
+// ErrPairingCancelled is returned.
+//
+// NOTE: this call returns once whatsmeow emits the first QR code (~1s),
+// not when the user finishes scanning. Successful pairing is signalled
+// by Status() reporting Paired=true; agents should poll Status after
+// the user scans.
 func (c *Client) PairQR(ctx context.Context) (QRPairing, error) {
 	if err := c.initLogStore(ctx); err != nil {
 		return QRPairing{}, err
@@ -84,14 +97,11 @@ func (c *Client) PairQR(ctx context.Context) (QRPairing, error) {
 		return QRPairing{}, err
 	}
 	if paired {
-		// Already paired — connect transparently and return an empty
-		// QRPairing so callers can proceed.
-		wm.AddEventHandler(c.handleEvent)
+		c.installHandler(wm)
 		if err := wm.Connect(); err != nil {
 			return QRPairing{}, fmt.Errorf("whatsapp: connect: %w", err)
 		}
 		c.mu.Lock()
-		c.wmeowClient = wm
 		c.connected = true
 		c.mu.Unlock()
 		return QRPairing{}, nil
@@ -101,44 +111,105 @@ func (c *Client) PairQR(ctx context.Context) (QRPairing, error) {
 	if err != nil {
 		return QRPairing{}, fmt.Errorf("whatsapp: open QR channel: %w", err)
 	}
-	wm.AddEventHandler(c.handleEvent)
+	c.installHandler(wm)
 	if err := wm.Connect(); err != nil {
 		return QRPairing{}, fmt.Errorf("whatsapp: connect during pair: %w", err)
 	}
 
-	var firstCode QRPairing
+	// Wait for the first code (or terminal event); spin off a goroutine
+	// to drain the rest of the channel so whatsmeow's pairing flow
+	// completes server-side.
 	for evt := range qrChan {
 		switch evt.Event {
 		case whatsmeow.QRChannelEventCode:
-			ascii := renderQRASCII(evt.Code)
 			pairing := QRPairing{
 				Code:      evt.Code,
-				ASCII:     ascii,
+				ASCII:     renderQRASCII(evt.Code),
 				ExpiresAt: time.Now().Add(evt.Timeout),
 			}
-			if firstCode.Code == "" {
-				firstCode = pairing
-			}
-			// Continue: next iteration is either a fresh code or success.
+			go drainQRChannel(c, wm, qrChan)
+			return pairing, nil
 		case "success":
 			c.mu.Lock()
-			c.wmeowClient = wm
 			c.connected = true
 			c.mu.Unlock()
-			return firstCode, nil
+			return QRPairing{}, nil
 		case "timeout":
-			wm.Disconnect()
-			return firstCode, ErrPairingTimeout
+			c.teardown(wm)
+			return QRPairing{}, ErrPairingTimeout
 		default:
-			wm.Disconnect()
-			return firstCode, fmt.Errorf("%w: %s", ErrPairingCancelled, evt.Event)
+			c.teardown(wm)
+			return QRPairing{}, fmt.Errorf("%w: %s", ErrPairingCancelled, evt.Event)
 		}
 	}
-	wm.Disconnect()
+	c.teardown(wm)
 	if ctx.Err() != nil {
-		return firstCode, ctx.Err()
+		return QRPairing{}, ctx.Err()
 	}
-	return firstCode, ErrPairingCancelled
+	return QRPairing{}, ErrPairingCancelled
+}
+
+// drainQRChannel consumes remaining QR rotations until pairing succeeds,
+// fails, or times out. On terminal events we update connection state and
+// log; we do *not* tear down on success because the active connection
+// continues to be used.
+func drainQRChannel(c *Client, wm *whatsmeow.Client, ch <-chan whatsmeow.QRChannelItem) {
+	for evt := range ch {
+		switch evt.Event {
+		case "success":
+			c.mu.Lock()
+			if c.wmeowClient == wm {
+				c.connected = true
+			}
+			c.mu.Unlock()
+			return
+		case "timeout":
+			c.logger.Warnf("QR pairing timed out before scan")
+			c.teardown(wm)
+			return
+		case whatsmeow.QRChannelEventCode:
+			// Subsequent rotations: nothing to do; the agent is
+			// expected to call Status to poll for Paired=true.
+		default:
+			c.logger.Warnf("QR channel terminal event: %s", evt.Event)
+			c.teardown(wm)
+			return
+		}
+	}
+}
+
+// teardown disconnects wm if it is still the active client and clears
+// the handler flag. Safe to call from goroutines.
+func (c *Client) teardown(wm *whatsmeow.Client) {
+	c.mu.Lock()
+	active := c.wmeowClient == wm
+	if active {
+		c.wmeowClient = nil
+		c.handlerInstalled = false
+		c.wmeowEpoch++
+		c.connected = false
+	}
+	c.mu.Unlock()
+	if wm != nil {
+		wm.Disconnect()
+	}
+}
+
+// installHandler atomically attaches the active client and registers
+// handleEvent exactly once for that client.
+func (c *Client) installHandler(wm *whatsmeow.Client) {
+	c.mu.Lock()
+	if c.wmeowClient != wm {
+		c.wmeowClient = wm
+		c.handlerInstalled = false
+		c.wmeowEpoch++
+	}
+	if !c.handlerInstalled {
+		epoch := c.wmeowEpoch
+		wm.AddEventHandler(c.makeHandler(epoch))
+		c.handlerInstalled = true
+	}
+	c.mu.Unlock()
 }
 
 // openWhatsmeow constructs (or loads) a whatsmeow.Client from the on-disk
@@ -155,12 +226,6 @@ func (c *Client) openWhatsmeow(ctx context.Context) (*whatsmeow.Client, bool, er
 		return nil, false, fmt.Errorf("whatsapp: get device: %w", err)
 	}
 	wm := whatsmeow.NewClient(device, c.logger)
-	if c.deviceName != "" {
-		// whatsmeow exposes its device props at the package level via
-		// store.DeviceProps; we leave this default to avoid cross-process
-		// surprises. The DeviceName is only echoed in StatusReport.
-		_ = c.deviceName
-	}
 	paired := device.ID != nil
 	return wm, paired, nil
 }
@@ -179,6 +244,3 @@ func renderQRASCII(code string) string {
 	qrterminal.GenerateWithConfig(code, cfg)
 	return buf.String()
 }
-
-// errClosing helper to make linter happy on unused imports during early dev.
-var _ = errors.Is

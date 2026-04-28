@@ -9,9 +9,23 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 )
 
-// handleEvent is the single event handler whatsmeow calls. We dispatch
-// to per-type helpers and keep individual handlers cheap (the event loop
-// is shared across all events).
+// makeHandler binds an event handler to a specific epoch so stale
+// Disconnected/LoggedOut events from a previous wmeowClient don't
+// mutate the state of a freshly-installed one.
+func (c *Client) makeHandler(epoch uint64) func(any) {
+	return func(raw any) {
+		c.mu.RLock()
+		current := c.wmeowEpoch
+		c.mu.RUnlock()
+		if current != epoch {
+			// Event from a stale client; ignore.
+			return
+		}
+		c.handleEvent(raw)
+	}
+}
+
+// handleEvent dispatches a single whatsmeow event.
 func (c *Client) handleEvent(raw any) {
 	switch e := raw.(type) {
 	case *events.Message:
@@ -19,12 +33,15 @@ func (c *Client) handleEvent(raw any) {
 	case *events.Receipt:
 		// receipts could be persisted; left as a future enhancement.
 	case *events.Connected:
-		// no-op; Status() reads IsConnected() directly.
+		c.mu.Lock()
+		c.connected = true
+		c.mu.Unlock()
 	case *events.Disconnected:
 		c.mu.Lock()
 		c.connected = false
 		c.mu.Unlock()
 	case *events.LoggedOut:
+		c.logger.Warnf("WhatsApp logged us out (reason: %v)", e.Reason)
 		c.mu.Lock()
 		c.connected = false
 		c.mu.Unlock()
@@ -32,7 +49,8 @@ func (c *Client) handleEvent(raw any) {
 }
 
 // onMessage normalises a whatsmeow message event into the local Message
-// model and persists it.
+// model and persists it. For previously-unseen group chats, schedules a
+// one-shot group-info fetch to back-fill the display name.
 func (c *Client) onMessage(e *events.Message) {
 	if e == nil || e.Message == nil {
 		return
@@ -57,14 +75,18 @@ func (c *Client) onMessage(e *events.Message) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = c.upsertMessage(ctx, m)
-	if m.SenderName != "" && !m.IsGroup {
+	if err := c.upsertMessage(ctx, m); err != nil {
+		c.logger.Warnf("upsert message %s in chat %s: %v", m.MessageID, m.ChatJID, err)
+	}
+	if !m.IsGroup && m.SenderName != "" {
 		c.updateChatDisplayName(ctx, m.ChatJID, m.SenderName)
+	}
+	if m.IsGroup {
+		// Best-effort: backfill the group's display name once.
+		go c.backfillGroupName(m.ChatJID)
 	}
 }
 
-// extractContent pulls the user-visible text and media metadata out of a
-// waE2E.Message proto across the many shapes WhatsApp uses.
 func extractContent(msg *waE2E.Message) (body string, kind MediaKind, name string, hasMedia bool) {
 	if msg == nil {
 		return
@@ -89,6 +111,7 @@ func extractContent(msg *waE2E.Message) (body string, kind MediaKind, name strin
 		}
 	}
 	if am := msg.GetAudioMessage(); am != nil {
+		_ = am
 		kind, hasMedia = MediaAudio, true
 	}
 	if dm := msg.GetDocumentMessage(); dm != nil {
@@ -99,6 +122,7 @@ func extractContent(msg *waE2E.Message) (body string, kind MediaKind, name strin
 		}
 	}
 	if sm := msg.GetStickerMessage(); sm != nil {
+		_ = sm
 		kind, hasMedia = MediaSticker, true
 	}
 	body = strings.TrimSpace(body)
