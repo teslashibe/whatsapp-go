@@ -96,12 +96,16 @@ _ = client.SendMessage(ctx, whatsapp.SendParams{
 | `SendMedia` | `whatsapp_send_media` |
 | `React` | `whatsapp_react` (proper reactions; whatsmeow supports them natively) |
 | `IsOnWhatsApp` | `whatsapp_check_whatsapp` |
-| `GetMedia` | `whatsapp_get_media` |
 
 ### V2 stretch
 | Method | Tool |
 |---|---|
 | `Watch` | `whatsapp_watch` |
+
+### Not yet implemented (deliberately)
+- `GetMedia` (download attachments by message ID). Persisting raw event
+  protos is required to reconstruct the encrypted download URL and PII
+  policy needs separate review; tracked as a follow-up.
 
 ## Permissions & operational notes
 
